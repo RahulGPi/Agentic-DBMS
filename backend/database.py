@@ -47,7 +47,7 @@ def get_current_schema():
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # 1. Get Tables
+            # 1. Get Tables (Public Schema Only)
             cursor.execute("""
                 SELECT table_name 
                 FROM information_schema.tables 
@@ -62,7 +62,7 @@ def get_current_schema():
                 cursor.execute("""
                     SELECT column_name, data_type
                     FROM information_schema.columns 
-                    WHERE table_name = %s
+                    WHERE table_name = %s AND table_schema = 'public'
                     ORDER BY ordinal_position
                 """, (table_name,))
                 columns_data = cursor.fetchall()
@@ -73,26 +73,38 @@ def get_current_schema():
                     FROM information_schema.table_constraints tc 
                     JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name
                     JOIN information_schema.columns c ON c.table_name = tc.table_name AND c.column_name = ccu.column_name
-                    WHERE constraint_type = 'PRIMARY KEY' AND tc.table_name = %s
+                    WHERE constraint_type = 'PRIMARY KEY' 
+                      AND tc.table_name = %s 
+                      AND tc.table_schema = 'public'
                 """, (table_name,))
                 pks = [r[0] for r in cursor.fetchall()]
 
-                # 4. Get Foreign Keys (NEW)
+                # 4. Get Foreign Keys (With Constraint Name)
                 cursor.execute("""
                     SELECT
                         kcu.column_name, 
                         ccu.table_name AS foreign_table_name,
-                        ccu.column_name AS foreign_column_name 
+                        ccu.column_name AS foreign_column_name,
+                        tc.constraint_name
                     FROM information_schema.key_column_usage AS kcu
                     JOIN information_schema.constraint_column_usage AS ccu
                         ON ccu.constraint_name = kcu.constraint_name
                     JOIN information_schema.table_constraints AS tc
                         ON tc.constraint_name = kcu.constraint_name
-                    WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = %s
+                    WHERE tc.constraint_type = 'FOREIGN KEY' 
+                      AND tc.table_name = %s
+                      AND tc.table_schema = 'public'
                 """, (table_name,))
                 fks = cursor.fetchall()
-                # Create a lookup dict for FKs: { 'user_id': 'users.id' }
-                fk_map = {row[0]: {'table': row[1], 'col': row[2]} for row in fks}
+                
+                # Map: 'col_name' -> { table, col, constraint_name }
+                fk_map = {}
+                for row in fks:
+                    fk_map[row[0]] = {
+                        'table': row[1], 
+                        'col': row[2],
+                        'constraint': row[3] # Capture the constraint name for deletion
+                    }
                 
                 formatted_columns = []
                 for col_name, dtype in columns_data:
@@ -100,7 +112,7 @@ def get_current_schema():
                         "name": col_name,
                         "type": dtype.upper(),
                         "isPk": col_name in pks,
-                        "fk": fk_map.get(col_name) # Will be None or {table, col}
+                        "fk": fk_map.get(col_name) 
                     })
                     
                 schema_output.append({
@@ -110,9 +122,6 @@ def get_current_schema():
                 })
                 
         return schema_output
-    except Exception as e:
-        print(f"Schema Fetch Error: {e}")
-        return []
     finally:
         conn.close()
 
@@ -120,7 +129,6 @@ def init_db():
     """Creates a sample table if none exist."""
     try:
         conn = get_db_connection()
-        # Create users
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -129,15 +137,15 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Create orders with FK
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id SERIAL PRIMARY KEY,
-                user_id INTEGER REFERENCES users(id),
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
                 amount DECIMAL(10,2),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         conn.close()
+        print("Database initialized successfully.")
     except Exception as e:
         print(f"Init DB Error: {e}")

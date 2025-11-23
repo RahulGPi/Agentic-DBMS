@@ -2,13 +2,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 from fastapi.middleware.cors import CORSMiddleware
-import database
-import llm_service
 from contextlib import asynccontextmanager
+import database
+import time
+import llm_service
 
 app = FastAPI()
 
-# Enable CORS so the React Frontend can talk to this Python Backend
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,10 +24,16 @@ class ChatRequest(BaseModel):
     message: str
 
 class DDLRequest(BaseModel):
-    action: str  # 'create_table', 'add_column', 'drop_column', 'drop_table'
+    action: str
     table_name: str
     column_name: Optional[str] = None
+    new_column_name: Optional[str] = None
     column_type: Optional[str] = None
+    new_table_name: Optional[str] = None
+    # For Foreign Keys
+    fk_table: Optional[str] = None
+    fk_column: Optional[str] = None
+    constraint_name: Optional[str] = None
 
 # --- API Endpoints ---
 
@@ -39,12 +46,8 @@ async def lifespan(app: FastAPI):
         print("Database initialized.")
     except Exception as e:
         print(f"Error connecting to DB: {e}")
-
 @app.get("/schema")
 def read_schema():
-    """
-    Used by the No-Code UI to visualize tables.
-    """
     try:
         return database.get_current_schema()
     except Exception as e:
@@ -52,96 +55,110 @@ def read_schema():
 
 @app.post("/chat")
 def chat_with_data(request: ChatRequest):
-    """
-    The Core Agent Endpoint.
-    1. Gets live schema from DB.
-    2. Sends schema + user question to LLM.
-    3. Receives SQL.
-    4. Executes SQL on DB.
-    5. Returns Data + Generated SQL (for UI transparency).
-    """
     print(f"User Query: {request.message}")
     
+    MAX_RETRIES = 5
+    attempt = 0
+    current_sql = ""
+    last_error = ""
+    
     try:
-        # Step 1: Get the current structure of the database
+        # Step 1: Get Schema
         current_schema = database.get_current_schema()
         
-        # Step 2: Ask the LLM to write SQL based on that structure
-        generated_sql = llm_service.generate_sql_from_query(request.message, current_schema)
+        # Step 2: Initial Generation
+        current_sql = llm_service.generate_sql_from_query(request.message, current_schema)
         
-        # Guard: Check if LLM returned an error message instead of SQL
-        if generated_sql.startswith("-- Error") or "Error connecting" in generated_sql:
-            return {
-                "response": "I'm having trouble thinking right now (LLM Error).",
-                "sql": generated_sql,
-                "data": []
-            }
-
-        print(f"LLM Generated SQL: {generated_sql}")
-
-        # Step 3: Execute the generated SQL
-        # We wrap this execution in a specific try/except to catch Bad SQL (Hallucinations)
-        try:
-            query_result = database.execute_query(generated_sql)
+        # SELF-CORRECTION LOOP
+        while attempt < MAX_RETRIES:
             
-            # Check if our database helper returned a logical error
+            if current_sql.startswith("-- Error"):
+                return { "response": "LLM Connectivity Error", "sql": current_sql, "data": [] }
+
+            print(f"Executing SQL (Attempt {attempt+1}): {current_sql}")
+            
+            # Try executing
+            query_result = database.execute_query(current_sql)
+            
+            # Check for DB Errors
             if isinstance(query_result, dict) and "error" in query_result:
-                return {
-                    "response": f"I generated SQL, but the database rejected it: {query_result['error']}",
-                    "sql": generated_sql,
-                    "data": []
-                }
+                last_error = query_result["error"]
+                print(f"Database Rejected SQL: {last_error}")
+                
+                if attempt < MAX_RETRIES - 1:
+                    print("Asking LLM to fix the query...")
+                    current_sql = llm_service.fix_generated_sql(
+                        request.message, 
+                        current_sql, 
+                        last_error, 
+                        current_schema
+                    )
+                    attempt += 1
+                    continue
+                else:
+                    return {
+                        "response": f"I tried {MAX_RETRIES} times but couldn't fix the error. Last error: {last_error}",
+                        "sql": current_sql,
+                        "data": []
+                    }
             
-            # Success!
             return {
-                "response": "Here is the data I found:",
-                "sql": generated_sql,
+                "response": f"Success! (Executed after {attempt+1} attempts)",
+                "sql": current_sql,
                 "data": query_result
-            }
-            
-        except Exception as db_err:
-             return {
-                "response": f"Database Execution Error: {str(db_err)}",
-                "sql": generated_sql,
-                "data": []
             }
 
     except Exception as e:
-        # General server error
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ddl")
 def execute_no_code_update(request: DDLRequest):
-    """
-    The No-Code Tool Endpoint.
-    Translates JSON actions into DDL (Data Definition Language) SQL.
-    """
     sql = ""
     try:
         if request.action == "create_table":
-            # Default to a table with just an ID
             sql = f"CREATE TABLE {request.table_name} (id SERIAL PRIMARY KEY);"
-            
         elif request.action == "add_column":
             if not request.column_name or not request.column_type:
                 raise HTTPException(status_code=400, detail="Column name and type required")
             sql = f"ALTER TABLE {request.table_name} ADD COLUMN {request.column_name} {request.column_type};"
-            
         elif request.action == "drop_column":
             if not request.column_name:
                 raise HTTPException(status_code=400, detail="Column name required")
             sql = f"ALTER TABLE {request.table_name} DROP COLUMN {request.column_name};"
-            
         elif request.action == "drop_table":
-             sql = f"DROP TABLE {request.table_name};"
+             sql = f"DROP TABLE {request.table_name} CASCADE;"
+        elif request.action == "rename_table":
+            if not request.new_table_name:
+                raise HTTPException(status_code=400, detail="New table name required")
+            sql = f"ALTER TABLE {request.table_name} RENAME TO {request.new_table_name};"
+        elif request.action == "rename_column":
+            if not request.column_name or not request.new_column_name:
+                raise HTTPException(status_code=400, detail="Column names required")
+            sql = f"ALTER TABLE {request.table_name} RENAME COLUMN {request.column_name} TO {request.new_column_name};"
+        elif request.action == "alter_column_type":
+            if not request.column_name or not request.column_type:
+                raise HTTPException(status_code=400, detail="Column name and type required")
+            sql = f"ALTER TABLE {request.table_name} ALTER COLUMN {request.column_name} TYPE {request.column_type} USING {request.column_name}::{request.column_type};"
+        
+        # --- NEW CONNECTION ACTIONS ---
+        elif request.action == "add_foreign_key":
+            # ALTER TABLE orders ADD CONSTRAINT fk_orders_users FOREIGN KEY (user_id) REFERENCES users(id)
+            if not request.column_name or not request.fk_table or not request.fk_column:
+                raise HTTPException(status_code=400, detail="FK details required")
+            
+            constraint_name = f"fk_{request.table_name}_{request.column_name}_{int(time.time())}"
+            sql = f"ALTER TABLE {request.table_name} ADD CONSTRAINT {constraint_name} FOREIGN KEY ({request.column_name}) REFERENCES {request.fk_table}({request.fk_column});"
+
+        elif request.action == "drop_foreign_key":
+            if not request.constraint_name:
+                raise HTTPException(status_code=400, detail="Constraint name required")
+            sql = f"ALTER TABLE {request.table_name} DROP CONSTRAINT {request.constraint_name};"
 
         else:
             raise HTTPException(status_code=400, detail=f"Unknown action: {request.action}")
 
         print(f"Executing DDL: {sql}")
-        
         result = database.execute_query(sql)
-        
         if isinstance(result, dict) and "error" in result:
              raise HTTPException(status_code=400, detail=result["error"])
 
@@ -152,5 +169,4 @@ def execute_no_code_update(request: DDLRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # Host 0.0.0.0 is required if running inside Docker to be accessible
     uvicorn.run(app, host="0.0.0.0", port=8000)
