@@ -1,2 +1,4 @@
 mp
 database_data
+__pycache__
+*.pyc

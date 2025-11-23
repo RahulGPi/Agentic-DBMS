@@ -1,36 +1,39 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from fastapi.middleware.cors import CORSMiddleware
 import database
+import llm_service
+from contextlib import asynccontextmanager
 
 app = FastAPI()
 
-# Enable CORS for the React Frontend
+# Enable CORS so the React Frontend can talk to this Python Backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Pydantic Models for Request Bodies ---
+# --- Request Models ---
 
-class SQLRequest(BaseModel):
-    sql: str
+class ChatRequest(BaseModel):
+    message: str
 
 class DDLRequest(BaseModel):
-    action: str  # 'create_table', 'add_column', 'drop_column'
+    action: str  # 'create_table', 'add_column', 'drop_column', 'drop_table'
     table_name: str
     column_name: Optional[str] = None
     column_type: Optional[str] = None
 
-# --- Routes ---
+# --- API Endpoints ---
 
-@app.on_event("startup")
-def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """Initialize DB with sample data on startup"""
+    # --- STARTUP PHASE ---
     try:
         database.init_db()
         print("Database initialized.")
@@ -39,39 +42,84 @@ def startup_event():
 
 @app.get("/schema")
 def read_schema():
-    """Returns the current database schema in JSON format."""
+    """
+    Used by the No-Code UI to visualize tables.
+    """
     try:
-        schema = database.get_current_schema()
-        return schema
+        return database.get_current_schema()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/ask")
-def execute_agent_sql(request: SQLRequest):
+@app.post("/chat")
+def chat_with_data(request: ChatRequest):
     """
-    Endpoint for the Agent to execute generated SQL.
+    The Core Agent Endpoint.
+    1. Gets live schema from DB.
+    2. Sends schema + user question to LLM.
+    3. Receives SQL.
+    4. Executes SQL on DB.
+    5. Returns Data + Generated SQL (for UI transparency).
     """
-    # SECURITY NOTE: In a real production app, you need strict safeguards here.
-    # This is a raw SQL execution endpoint.
-    print(f"Executing SQL: {request.sql}")
-    result = database.execute_query(request.sql)
+    print(f"User Query: {request.message}")
     
-    if isinstance(result, dict) and "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
+    try:
+        # Step 1: Get the current structure of the database
+        current_schema = database.get_current_schema()
         
-    return result
+        # Step 2: Ask the LLM to write SQL based on that structure
+        generated_sql = llm_service.generate_sql_from_query(request.message, current_schema)
+        
+        # Guard: Check if LLM returned an error message instead of SQL
+        if generated_sql.startswith("-- Error") or "Error connecting" in generated_sql:
+            return {
+                "response": "I'm having trouble thinking right now (LLM Error).",
+                "sql": generated_sql,
+                "data": []
+            }
+
+        print(f"LLM Generated SQL: {generated_sql}")
+
+        # Step 3: Execute the generated SQL
+        # We wrap this execution in a specific try/except to catch Bad SQL (Hallucinations)
+        try:
+            query_result = database.execute_query(generated_sql)
+            
+            # Check if our database helper returned a logical error
+            if isinstance(query_result, dict) and "error" in query_result:
+                return {
+                    "response": f"I generated SQL, but the database rejected it: {query_result['error']}",
+                    "sql": generated_sql,
+                    "data": []
+                }
+            
+            # Success!
+            return {
+                "response": "Here is the data I found:",
+                "sql": generated_sql,
+                "data": query_result
+            }
+            
+        except Exception as db_err:
+             return {
+                "response": f"Database Execution Error: {str(db_err)}",
+                "sql": generated_sql,
+                "data": []
+            }
+
+    except Exception as e:
+        # General server error
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ddl")
 def execute_no_code_update(request: DDLRequest):
     """
-    Endpoint for the No-Code tool to update schema.
-    Constructs SQL based on the structured request.
+    The No-Code Tool Endpoint.
+    Translates JSON actions into DDL (Data Definition Language) SQL.
     """
     sql = ""
-    
     try:
         if request.action == "create_table":
-            # Simple default table creation
+            # Default to a table with just an ID
             sql = f"CREATE TABLE {request.table_name} (id SERIAL PRIMARY KEY);"
             
         elif request.action == "add_column":
@@ -88,14 +136,15 @@ def execute_no_code_update(request: DDLRequest):
              sql = f"DROP TABLE {request.table_name};"
 
         else:
-            raise HTTPException(status_code=400, detail="Unknown action")
+            raise HTTPException(status_code=400, detail=f"Unknown action: {request.action}")
 
         print(f"Executing DDL: {sql}")
+        
         result = database.execute_query(sql)
         
         if isinstance(result, dict) and "error" in result:
-            raise HTTPException(status_code=400, detail=result["error"])
-            
+             raise HTTPException(status_code=400, detail=result["error"])
+
         return {"status": "success", "sql_executed": sql}
 
     except Exception as e:
@@ -103,4 +152,5 @@ def execute_no_code_update(request: DDLRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    # Host 0.0.0.0 is required if running inside Docker to be accessible
     uvicorn.run(app, host="0.0.0.0", port=8000)

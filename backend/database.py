@@ -13,7 +13,7 @@ def get_db_connection():
     """Establishes a connection to the PostgreSQL database."""
     conn = psycopg.connect(
         host=DB_HOST,
-        database=DB_NAME,
+        dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASS,
         port=DB_PORT
